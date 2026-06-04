@@ -1,6 +1,6 @@
 {
   "name": "pi-undo-redo",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Undo/redo for Pi conversations and workspace changes with hybrid git and non-git snapshots.",
   "type": "module",
   "license": "MIT",
