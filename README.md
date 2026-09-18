@@ -4,7 +4,9 @@ Undo/redo for Pi conversations and workspace changes with hybrid git/non-git beh
 
 In git repositories this extension keeps file snapshots in a shadow git repository and records per-message patch metadata in the Pi session. `/undo` navigates the conversation tree back to the previous user message and reverts only the files changed by the undone message(s). `/redo` restores the files and conversation leaf captured before undo.
 
-In non-git directories it does **not** scan or snapshot the whole workspace. It snapshots only explicit file paths touched by Pi file tools that provide a path (`write` and `edit`). Shell commands and custom tools without explicit path metadata are not parsed for paths and are not promised to be undo-restorable.
+In non-git directories it does **not** scan or snapshot the whole workspace. It snapshots only explicit file paths touched by Pi file tools that provide a path (`write` and `edit`). Shell commands and custom tools without explicit path metadata are not parsed for paths and are not promised to be undo-restorable. A non-git path outside the snapshot scope - outside the workspace root, under `.git`, `.pi`, or `node_modules`, a directory, or a file above `largeFileLimitBytes` - stays out of that turn's checkpoint and is reported with a single warning per turn.
+
+The extension only records snapshots and navigates the conversation tree; it does not rewrite tool arguments and does not veto `write`/`edit` execution.
 
 A dirty guard blocks `/undo`, `/redo`, and `/tree` when unsnapshotted workspace changes would be overwritten.
 
@@ -32,7 +34,7 @@ Configure in `~/.pi/agent/settings.json` or `.pi/settings.json`:
 Defaults:
 
 - `storageDir`: `~/.pi/agent/state/pi-undo-redo`
-- `largeFileLimitBytes`: `2097152` (2 MiB; large explicit non-git files are skipped/fail closed with a warning instead of silently claiming undo support)
+- `largeFileLimitBytes`: `2097152` (2 MiB). In non-git mode a path above this limit is excluded from the turn's checkpoint with a warning instead of being silently advertised as undo-restorable.
 - `gitTimeoutMs`: `30000`
 - `enabled`: `true`
 
@@ -55,10 +57,11 @@ Defaults:
 - `/tree` restores only the cumulative explicit checkpoint files along the branch up to the target node; it never restores or diffs a whole cwd snapshot.
 - Dirty guard checks only affected checkpoint/touched paths, so unrelated sentinel files are not included.
 - Shell-created files in non-git mode are not parsed or restored. The extension warns once per agent turn when a bash tool runs in non-git mode.
+- A `write`/`edit` path outside the non-git snapshot scope is reported once per turn as having no undo coverage, stays out of that turn's checkpoint claim, and is not captured later in the same turn. `/undo` and `/redo` therefore leave it alone; `/tree` still moves the workspace to the selected node's state, and `/redo` after `/tree` restores the previously covered files that `/tree` replaced. If snapshot bookkeeping itself fails before the path is known, that turn's checkpoint is dropped so nothing is claimed.
 
 ## Path safety in non-git mode
 
-Explicit paths are normalized relative to the workspace root. Relative paths resolve against Pi's current `ctx.cwd`; absolute paths are accepted only when they remain inside the workspace root. Paths containing NUL, escaping via `..`, or targeting dangerous workspace directories such as `.git`, `.pi`, or `node_modules` are rejected. Windows-style paths normalize to `/`-separated relative paths in checkpoint metadata.
+Explicit paths are normalized relative to the workspace root. Relative paths resolve against Pi's current `ctx.cwd`; absolute paths are accepted only when they remain inside the workspace root. Paths containing NUL, escaping via `..`, or targeting dangerous workspace directories such as `.git`, `.pi`, or `node_modules` are never snapshotted or restored in non-git mode, so no checkpoint ever lists them and `/undo` and `/redo` leave them alone: the pending `write`/`edit` still runs, and the extension reports the path once per turn as having no undo coverage. Windows-style paths normalize to `/`-separated relative paths in checkpoint metadata.
 
 ## Notes
 

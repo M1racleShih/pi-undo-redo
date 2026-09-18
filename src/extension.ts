@@ -102,6 +102,8 @@ export default function undoRedo(pi: ExtensionAPI) {
   let pendingBeforeSnapshot: PendingBeforeSnapshot | undefined;
   let snapshotter: ShadowGit | undefined;
   let suppressTreeRestore = 0;
+  let warnedCaptureSkip = false;
+  const skippedPaths = new Set<string>();
 
   pi.on("session_start", async (_event, ctx) => {
     const settings = await loadSettings(ctx.cwd);
@@ -129,6 +131,8 @@ export default function undoRedo(pi: ExtensionAPI) {
     pi.appendEntry(REDO_EXT, []);
     active = undefined;
     pendingBeforeSnapshot = undefined;
+    warnedCaptureSkip = false;
+    skippedPaths.clear();
 
     try {
       const snap = await getSnapshotter(ctx.cwd, ctx.sessionManager.getSessionId());
@@ -172,16 +176,20 @@ export default function undoRedo(pi: ExtensionAPI) {
 
   pi.on("tool_call", async (event, ctx) => {
     if (!active && !pendingBeforeSnapshot) return;
-    const snap = await getSnapshotter(ctx.cwd, ctx.sessionManager.getSessionId());
-    if (await snap.isGitMode()) return;
+    let snap: ShadowGit;
+    try {
+      snap = await getSnapshotter(ctx.cwd, ctx.sessionManager.getSessionId());
+      if (await snap.isGitMode()) return;
+    } catch (error) {
+      // Setup failures happen before a path is identified, so this turn's checkpoint is
+      // dropped rather than keeping coverage the warning cannot stand behind.
+      active = undefined;
+      pendingBeforeSnapshot = undefined;
+      notifyCaptureSkip(ctx, `non-git snapshot bookkeeping failed (${message(error)}); this turn's checkpoint is skipped`);
+      return;
+    }
     if (event.toolName === "write" || event.toolName === "edit") {
-      try {
-        await captureExplicitToolPath(snap, event.input?.path, event.toolName === "write" ? event.input?.content : undefined, ctx);
-      } catch (error) {
-        const reason = `Pi undo/redo non-git capture blocked ${event.toolName}: ${message(error)}`;
-        ctx.ui.notify(reason, "warning");
-        return { block: true, reason };
-      }
+      await captureExplicitToolPath(snap, event.input?.path, event.toolName === "write" ? event.input?.content : undefined, ctx);
       return;
     }
     if (event.toolName === "bash" && active && !active.warnedNonGitShell) {
@@ -635,15 +643,41 @@ export default function undoRedo(pi: ExtensionAPI) {
     rawContent: unknown,
     ctx: { cwd: string; ui: { notify(message: string, level?: "warning" | "info" | "error"): void } },
   ) {
-    if (typeof rawPath !== "string") throw new Error("tool input has no string path");
-    const rel = await snap.resolveWorkspacePath(rawPath, ctx.cwd);
-    await snap.assertExplicitPathSupported(rel, rawContent);
-    if (!active) return;
-    if (!active.snapshotFiles.has(rel)) {
-      active.beforeSnapshot = await snap.capturePathBefore(rel, active.beforeSnapshot);
-      active.snapshotFiles.add(rel);
+    let rel: string | undefined;
+    try {
+      if (typeof rawPath !== "string") throw new Error("tool input has no string path");
+      rel = await snap.resolveWorkspacePath(rawPath, ctx.cwd);
+      // A path skipped once this turn stays out of the checkpoint: capturing it later
+      // would record a mid-turn state as the message's before-state.
+      if (skippedPaths.has(rel)) return;
+      const skipReason = await snap.explicitPathSkipReason(rel, rawContent);
+      if (skipReason) {
+        skippedPaths.add(rel);
+        // Drop the turn's claim on this path. `snapshotFiles` stays cumulative so the
+        // turn's after-snapshot keeps its current content for /tree and /redo.
+        active?.touchedFiles.delete(rel);
+        notifyCaptureSkip(ctx, `${rel} is not snapshotted this turn (${skipReason}); this change has no undo coverage`);
+        return;
+      }
+      if (!active) return;
+      if (!active.snapshotFiles.has(rel)) {
+        active.beforeSnapshot = await snap.capturePathBefore(rel, active.beforeSnapshot);
+        active.snapshotFiles.add(rel);
+      }
+      active.touchedFiles.add(rel);
+    } catch (error) {
+      if (rel) {
+        skippedPaths.add(rel);
+        active?.touchedFiles.delete(rel);
+      }
+      notifyCaptureSkip(ctx, `${String(rawPath)} is not snapshotted this turn (${message(error)}); this change has no undo coverage`);
     }
-    active.touchedFiles.add(rel);
+  }
+
+  function notifyCaptureSkip(ctx: { ui: { notify(message: string, level?: "warning" | "info" | "error"): void } }, detail: string) {
+    if (warnedCaptureSkip) return;
+    warnedCaptureSkip = true;
+    ctx.ui.notify(`Pi undo/redo: ${detail}. The edit is not blocked.`, "warning");
   }
 }
 
@@ -758,15 +792,18 @@ export class ShadowGit {
     });
   }
 
-  async assertExplicitPathSupported(rel: string, content?: unknown): Promise<void> {
+  async explicitPathSkipReason(rel: string, content?: unknown): Promise<string | undefined> {
     await this.ensureRepoInfo();
-    if (this.sourceGitDir) return;
+    if (this.sourceGitDir) return undefined;
     if (typeof content === "string" && Buffer.byteLength(content, "utf8") > this.settings.largeFileLimitBytes) {
-      throw new Error(`explicit file exceeds largeFileLimitBytes: ${rel}`);
+      return `written content exceeds largeFileLimitBytes (${this.settings.largeFileLimitBytes})`;
     }
     const info = await stat(path.join(this.root(), rel)).catch(() => undefined);
-    if (info?.isDirectory()) throw new Error(`refusing to snapshot directory path: ${rel}`);
-    if (info?.isFile() && info.size > this.settings.largeFileLimitBytes) throw new Error(`explicit file exceeds largeFileLimitBytes: ${rel}`);
+    if (info?.isDirectory()) return "path is a directory";
+    if (info?.isFile() && info.size > this.settings.largeFileLimitBytes) {
+      return `existing file exceeds largeFileLimitBytes (${this.settings.largeFileLimitBytes})`;
+    }
+    return undefined;
   }
 
   private async changedFilesForSnapshotImpl(snapshot: string, files?: string[]): Promise<Set<string>> {
