@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -8,9 +8,17 @@ import undoRedo, { ShadowGit } from "../src/extension.ts";
 
 const settings = { enabled: true, storageDir: "", largeFileLimitBytes: 1024 * 1024, gitTimeoutMs: 30_000 };
 
+// Snapshots must prune ignored trees: node_modules-sized directories used to be enumerated in
+// full on every call and then thrown away, which cost seconds per user message in real projects.
+const IGNORED_NOISE_FILES = 200;
+
 async function main() {
   testActivation();
   await testGitSnapshot();
+  await testUntrackedListingPrunesIgnoredTrees();
+  await testCleanTurnSkipsTheAfterSnapshot();
+  await testTrackedIgnoredPathsStaySnapshotted();
+  await testTrackedIgnoredSymlinksStaySnapshotted();
   await testNonGitTouchedPaths();
   await testExplicitPathSkipReason();
   await testToolCallNeverBlocksWrites();
@@ -62,6 +70,240 @@ async function testGitSnapshot() {
     await snap.revertFiles(after, files);
     assert(readFileSync(path.join(root, "tracked.txt"), "utf8") === "changed\n", "git redo tracked content");
     assert(readFileSync(path.join(root, "shell-new.txt"), "utf8") === "created\n", "git redo new file");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(storage, { recursive: true, force: true });
+  }
+}
+
+async function testUntrackedListingPrunesIgnoredTrees() {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-undo-redo-ignored-"));
+  const storage = await mkdtemp(path.join(tmpdir(), "pi-undo-redo-storage-"));
+  // GIT_TRACE records every git invocation (including argv), which is how this test checks the
+  // shape of the untracked listing without depending on wall-clock timings.
+  const traceFile = path.join(storage, "git-trace.log");
+  const previousTrace = process.env.GIT_TRACE;
+  process.env.GIT_TRACE = traceFile;
+  try {
+    git(root, ["init"]);
+    git(root, ["config", "user.name", "self-test"]);
+    git(root, ["config", "user.email", "self-test@example.local"]);
+    writeFileSync(path.join(root, ".gitignore"), "node_modules/\ndist/\n");
+    writeFileSync(path.join(root, "tracked.txt"), "base\n");
+    git(root, ["add", ".gitignore", "tracked.txt"]);
+    git(root, ["commit", "-m", "init"]);
+
+    mkdirSync(path.join(root, "node_modules", "pkg"), { recursive: true });
+    for (let i = 0; i < IGNORED_NOISE_FILES; i++) writeFileSync(path.join(root, "node_modules", "pkg", `file-${i}.js`), "x\n");
+    mkdirSync(path.join(root, "dist"), { recursive: true });
+    for (let i = 0; i < 100; i++) writeFileSync(path.join(root, "dist", `chunk-${i}.js`), "x\n");
+
+    const snap = new ShadowGit(root, "self-test", { ...settings, storageDir: storage });
+    assert(await snap.available(), "git snapshotter should be available");
+    const before = await snap.track();
+    const listings = gitTraceCalls(traceFile).filter((line) => line.includes("ls-files") && line.includes("--others"));
+    assert(listings.length > 0, "the snapshot should list untracked files");
+    const unpruned = listings.filter((line) => !line.includes("--exclude-standard"));
+    assert(unpruned.length === 0, `untracked listing must prune ignored trees: ${unpruned.join(" | ")}`);
+
+    // Second snapshot on the same instance: the shadow identity must not be rewritten and the
+    // worktree must be read once (--modified and --others in one call instead of two).
+    const warmCalls = gitTraceCursor(traceFile);
+    await snap.track();
+    const warm = warmCalls();
+    assert(!warm.some((line) => line.includes(" config ")), `a warm snapshot must not rewrite identity config: ${warm.join(" | ")}`);
+    const worktreeListings = warm.filter(
+      (line) => line.includes("diff-files") || (line.includes("ls-files") && (line.includes("--others") || line.includes("--modified"))),
+    );
+    assert(worktreeListings.length === 1, `one snapshot should need a single worktree listing, saw ${worktreeListings.length}: ${worktreeListings.join(" | ")}`);
+    assert(warm.length <= 5, `a warm snapshot should stay within 5 git processes, saw ${warm.length}: ${warm.join(" | ")}`);
+
+    writeFileSync(path.join(root, "tracked.txt"), "changed\n");
+    writeFileSync(path.join(root, "ordinary.txt"), "created\n");
+    writeFileSync(path.join(root, "node_modules", "pkg", "file-0.js"), "changed\n");
+    const after = await snap.track();
+    const files = await snap.patchFiles(before);
+    assert(files.includes("tracked.txt"), "pruning must keep tracked modifications");
+    assert(files.includes("ordinary.txt"), "pruning must keep ordinary untracked files");
+    assert(!files.some((file) => file.startsWith("node_modules/")), "ignored files must stay out of the snapshot");
+    await snap.revertFiles(before, files);
+    assert(readFileSync(path.join(root, "tracked.txt"), "utf8") === "base\n", "pruning must keep tracked undo");
+    assert(!existsSync(path.join(root, "ordinary.txt")), "pruning must keep untracked undo");
+    await snap.revertFiles(after, files);
+    assert(readFileSync(path.join(root, "ordinary.txt"), "utf8") === "created\n", "pruning must keep untracked redo");
+  } finally {
+    if (previousTrace === undefined) delete process.env.GIT_TRACE;
+    else process.env.GIT_TRACE = previousTrace;
+    await rm(root, { recursive: true, force: true });
+    await rm(storage, { recursive: true, force: true });
+  }
+}
+
+async function testCleanTurnSkipsTheAfterSnapshot() {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-undo-redo-clean-"));
+  const agentDir = await mkdtemp(path.join(tmpdir(), "pi-undo-redo-agent-"));
+  const storage = await mkdtemp(path.join(tmpdir(), "pi-undo-redo-storage-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const previousTrace = process.env.GIT_TRACE;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  process.env.GIT_TRACE = path.join(storage, "git-trace.log");
+  const traceFile = path.join(storage, "git-trace.log");
+  try {
+    git(root, ["init"]);
+    git(root, ["config", "user.name", "self-test"]);
+    git(root, ["config", "user.email", "self-test@example.local"]);
+    writeFileSync(path.join(root, "tracked.txt"), "base\n");
+    git(root, ["add", "tracked.txt"]);
+    git(root, ["commit", "-m", "init"]);
+    writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ undoRedo: { storageDir: storage, largeFileLimitBytes: 1024 } }));
+
+    const hook = createHookHarness(root);
+    await hook.emit("session_start", {});
+    await hook.emit("before_agent_start", { prompt: HOOK_PROMPT });
+    await hook.emit("message_start", { message: { role: "assistant", content: [] } });
+
+    const cleanTurnCalls = gitTraceCursor(traceFile);
+    await hook.emit("agent_end", {});
+    const cleanTurn = cleanTurnCalls();
+
+    const checkpoint = hook.appended.filter((entry) => entry.customType === "pi-undo-redo").at(-1)?.data;
+    assert(checkpoint, "a clean turn should still persist a checkpoint");
+    assert(checkpoint.beforeSnapshot === checkpoint.afterSnapshot, "a clean turn should reuse its before snapshot");
+    assert(checkpoint.files.length === 0, `a clean turn changes no files (got ${JSON.stringify(checkpoint.files)})`);
+    assert(
+      !cleanTurn.some((line) => line.includes("ls-files")),
+      `a turn without tool calls must not walk the worktree again: ${cleanTurn.join(" | ") || "(no git calls)"}`,
+    );
+
+    // A turn that calls a tool still snapshots the workspace, so the shortcut stays honest.
+    await hook.emit("before_agent_start", { prompt: HOOK_PROMPT });
+    await hook.emit("message_start", { message: { role: "assistant", content: [] } });
+    await hook.emit("tool_call", { toolName: "write", input: { path: path.join(root, "tracked.txt"), content: "changed\n" } });
+    writeFileSync(path.join(root, "tracked.txt"), "changed\n");
+    const toolTurnCalls = gitTraceCursor(traceFile);
+    await hook.emit("agent_end", {});
+    const toolTurn = toolTurnCalls();
+
+    const toolCheckpoint = hook.appended.filter((entry) => entry.customType === "pi-undo-redo").at(-1)?.data;
+    assert(toolCheckpoint.files.includes("tracked.txt"), "a tool turn should record the changed file");
+    assert(
+      toolTurn.some((line) => line.includes("ls-files")),
+      `a tool turn must snapshot the worktree again: ${toolTurn.join(" | ") || "(no git calls)"}`,
+    );
+    assert(toolCheckpoint.beforeSnapshot !== toolCheckpoint.afterSnapshot, "a tool turn must record a new after snapshot");
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    if (previousTrace === undefined) delete process.env.GIT_TRACE;
+    else process.env.GIT_TRACE = previousTrace;
+    await rm(root, { recursive: true, force: true });
+    await rm(agentDir, { recursive: true, force: true });
+    await rm(storage, { recursive: true, force: true });
+  }
+}
+
+async function testTrackedIgnoredPathsStaySnapshotted() {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-undo-redo-tracked-ignored-"));
+  const storage = await mkdtemp(path.join(tmpdir(), "pi-undo-redo-storage-"));
+  try {
+    git(root, ["init"]);
+    git(root, ["config", "user.name", "self-test"]);
+    git(root, ["config", "user.email", "self-test@example.local"]);
+    writeFileSync(path.join(root, ".gitignore"), "dist/\n");
+    mkdirSync(path.join(root, "dist"), { recursive: true });
+    mkdirSync(path.join(root, "src"), { recursive: true });
+    writeFileSync(path.join(root, "dist", "out.js"), "built\n");
+    writeFileSync(path.join(root, "src", "app.js"), "base\n");
+    git(root, ["add", ".gitignore", "src/app.js"]);
+    git(root, ["add", "-f", "dist/out.js"]);
+    git(root, ["commit", "-m", "init"]);
+
+    const snap = new ShadowGit(root, "self-test", { ...settings, storageDir: storage });
+    assert(await snap.isGitMode(), "tracked repository expected");
+    const before = await snap.track();
+    writeFileSync(path.join(root, "dist", "out.js"), "rebuilt\n");
+    const after = await snap.track();
+    const files = await snap.patchFiles(before);
+    assert(files.includes("dist/out.js"), "a tracked file matching an ignore rule must stay snapshotted");
+    await snap.revertFiles(before, files);
+    assert(readFileSync(path.join(root, "dist", "out.js"), "utf8") === "built\n", "tracked-but-ignored content should be restorable");
+    await snap.revertFiles(after, files);
+    assert(readFileSync(path.join(root, "dist", "out.js"), "utf8") === "rebuilt\n", "tracked-but-ignored content should be redoable");
+
+    // Joins the repository after the shadow index already exists.
+    writeFileSync(path.join(root, "dist", "late.js"), "late\n");
+    git(root, ["add", "-f", "dist/late.js"]);
+    const mid = await snap.track();
+    writeFileSync(path.join(root, "dist", "late.js"), "later\n");
+    const later = await snap.track();
+    const lateFiles = await snap.patchFiles(mid);
+    assert(lateFiles.includes("dist/late.js"), "a tracked-but-ignored file added later must stay snapshotted");
+    await snap.revertFiles(mid, lateFiles);
+    assert(readFileSync(path.join(root, "dist", "late.js"), "utf8") === "late\n", "later tracked-but-ignored content should be restorable");
+
+    // Deleting one must not break the snapshot of everything else.
+    rmSync(path.join(root, "dist", "out.js"));
+    writeFileSync(path.join(root, "src", "app.js"), "changed\n");
+    const afterDelete = await snap.track();
+    const deleteFiles = await snap.patchFiles(later);
+    assert(deleteFiles.includes("src/app.js"), "deleting a tracked-but-ignored file must not break the snapshot");
+    await snap.revertFiles(later, deleteFiles);
+    assert(readFileSync(path.join(root, "src", "app.js"), "utf8") === "base\n", "a snapshot taken after the deletion stays usable");
+    await snap.revertFiles(afterDelete, deleteFiles);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(storage, { recursive: true, force: true });
+  }
+}
+
+function canCreateSymlinks() {
+  const target = path.join(tmpdir(), `pi-undo-redo-symlink-target-${process.pid}`);
+  const link = path.join(tmpdir(), `pi-undo-redo-symlink-link-${process.pid}`);
+  try {
+    writeFileSync(target, "x\n");
+    symlinkSync(target, link, "file");
+    return true;
+  } catch {
+    return false;
+  } finally {
+    rmSync(link, { force: true });
+    rmSync(target, { force: true });
+  }
+}
+
+async function testTrackedIgnoredSymlinksStaySnapshotted() {
+  if (!canCreateSymlinks()) {
+    console.log("self-test: skipped tracked symlink case (this platform does not allow creating symlinks)");
+    return;
+  }
+  const root = await mkdtemp(path.join(tmpdir(), "pi-undo-redo-tracked-symlink-"));
+  const storage = await mkdtemp(path.join(tmpdir(), "pi-undo-redo-storage-"));
+  try {
+    git(root, ["init"]);
+    git(root, ["config", "user.name", "self-test"]);
+    git(root, ["config", "user.email", "self-test@example.local"]);
+    writeFileSync(path.join(root, ".gitignore"), "dist/\n");
+    mkdirSync(path.join(root, "dist"), { recursive: true });
+    writeFileSync(path.join(root, "dist", "target.js"), "x\n");
+    writeFileSync(path.join(root, "dist", "other.js"), "y\n");
+    symlinkSync("target.js", path.join(root, "dist", "link.js"), "file");
+    git(root, ["add", ".gitignore"]);
+    try {
+      git(root, ["add", "-f", "dist/target.js", "dist/other.js", "dist/link.js"]);
+    } catch {
+      console.log("self-test: skipped tracked symlink case (git does not track symlinks here)");
+      return;
+    }
+    git(root, ["commit", "-m", "init"]);
+
+    const snap = new ShadowGit(root, "self-test", { ...settings, storageDir: storage });
+    const before = await snap.track();
+    rmSync(path.join(root, "dist", "link.js"));
+    symlinkSync("other.js", path.join(root, "dist", "link.js"), "file");
+    const after = await snap.track();
+    const files = await snap.patchFiles(before);
+    assert(files.includes("dist/link.js"), "a tracked symlink inside an ignored directory must stay snapshotted");
+    await snap.revertFiles(after, files);
   } finally {
     await rm(root, { recursive: true, force: true });
     await rm(storage, { recursive: true, force: true });
@@ -460,6 +702,27 @@ function git(cwd, args) {
   const result = spawnSync("git", args, { cwd, encoding: "utf8" });
   if (result.status !== 0) throw new Error(result.stderr || result.stdout || `git ${args.join(" ")} failed`);
   return result.stdout;
+}
+
+function gitTraceCalls(traceFile) {
+  let text = "";
+  try {
+    text = readFileSync(traceFile, "utf8");
+  } catch {
+    return [];
+  }
+  return text.split(/\r?\n/).filter((line) => line.includes("built-in: git "));
+}
+
+/** Returns a reader that yields only git invocations recorded after the reader was created. */
+function gitTraceCursor(traceFile) {
+  let seen = gitTraceCalls(traceFile).length;
+  return () => {
+    const lines = gitTraceCalls(traceFile);
+    const slice = lines.slice(seen);
+    seen = lines.length;
+    return slice;
+  };
 }
 
 function assert(condition, message) {

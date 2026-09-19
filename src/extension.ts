@@ -64,6 +64,7 @@ type ActiveCheckpoint = Omit<Checkpoint, "finalLeafId" | "afterSnapshot" | "file
   snapshotFiles: Set<string>;
   touchedFiles: Set<string>;
   warnedNonGitShell: boolean;
+  hadToolCall: boolean;
 };
 
 type PendingBeforeSnapshot = {
@@ -171,11 +172,13 @@ export default function undoRedo(pi: ExtensionAPI) {
       snapshotFiles: new Set(pending.snapshotFiles ?? []),
       touchedFiles: new Set(),
       warnedNonGitShell: false,
+      hadToolCall: false,
     };
   });
 
   pi.on("tool_call", async (event, ctx) => {
     if (!active && !pendingBeforeSnapshot) return;
+    if (active) active.hadToolCall = true;
     let snap: ShadowGit;
     try {
       snap = await getSnapshotter(ctx.cwd, ctx.sessionManager.getSessionId());
@@ -473,8 +476,11 @@ export default function undoRedo(pi: ExtensionAPI) {
       const touchedFiles = [...current.touchedFiles];
       const snapshotFiles = unique([...current.snapshotFiles, ...touchedFiles]);
       const gitMode = await snap.isGitMode();
-      const afterSnapshot = await snap.track(gitMode ? touchedFiles : snapshotFiles);
-      const files = await snap.patchFiles(current.beforeSnapshot, touchedFiles);
+      // A turn without a single tool call cannot have changed the workspace, so the before
+      // snapshot is still current: reuse it instead of walking the tree a second time.
+      const untouchedTurn = gitMode && !current.hadToolCall;
+      const afterSnapshot = untouchedTurn ? current.beforeSnapshot : await snap.track(gitMode ? touchedFiles : snapshotFiles);
+      const files = untouchedTurn ? [] : await snap.patchFiles(current.beforeSnapshot, touchedFiles);
       const checkpoint: Checkpoint = {
         userEntryId: current.userEntryId,
         beforeLeafId: current.beforeLeafId,
@@ -948,6 +954,9 @@ export class ShadowGit {
 
   private async protectSnapshot(snapshot: string): Promise<void> {
     const ref = `refs/pi-undo-redo/snapshots/${snapshot}`;
+    // Already protected: recreating the commit would add a dangling object and two git processes
+    // for every no-op snapshot. Packed refs fall through to the explicit call below.
+    if (existsSync(path.join(this.shadow(), "refs", "pi-undo-redo", "snapshots", snapshot))) return;
     const commit = await this.git(this.shadowArgs(["commit-tree", snapshot, "-m", `[pi-undo-redo] ${snapshot}`]));
     if (commit.code !== 0) throw new Error(commit.stderr || commit.stdout || "git commit-tree failed");
     const update = await this.git(this.shadowArgs(["update-ref", ref, commit.stdout.trim()]));
@@ -958,19 +967,23 @@ export class ShadowGit {
     await this.ensureRepoInfo();
     const gitdir = this.shadow();
     await mkdir(gitdir, { recursive: true });
-    if (!this.initialized && !existsSync(path.join(gitdir, "HEAD"))) {
-      const init = await this.git(["init"], { env: { GIT_DIR: gitdir, GIT_WORK_TREE: this.root() } });
-      if (init.code !== 0) throw new Error(init.stderr || init.stdout || "git init failed");
-      await this.git(["--git-dir", gitdir, "config", "core.autocrlf", "false"]);
-      await this.git(["--git-dir", gitdir, "config", "core.longpaths", "true"]);
-      await this.git(["--git-dir", gitdir, "config", "core.symlinks", "true"]);
-      await this.git(["--git-dir", gitdir, "config", "core.fsmonitor", "false"]);
+    if (!this.initialized) {
+      if (!existsSync(path.join(gitdir, "HEAD"))) {
+        const init = await this.git(["init"], { env: { GIT_DIR: gitdir, GIT_WORK_TREE: this.root() } });
+        if (init.code !== 0) throw new Error(init.stderr || init.stdout || "git init failed");
+        await this.git(["--git-dir", gitdir, "config", "core.autocrlf", "false"]);
+        await this.git(["--git-dir", gitdir, "config", "core.longpaths", "true"]);
+        await this.git(["--git-dir", gitdir, "config", "core.symlinks", "true"]);
+        await this.git(["--git-dir", gitdir, "config", "core.fsmonitor", "false"]);
+      }
+      // Written once per instance: running these on every call cost two git processes for values
+      // that never change.
+      const name = await this.git(["--git-dir", gitdir, "config", "user.name", "pi-undo-redo"]);
+      if (name.code !== 0) throw new Error(name.stderr || name.stdout || "git config user.name failed");
+      const email = await this.git(["--git-dir", gitdir, "config", "user.email", "pi-undo-redo@local"]);
+      if (email.code !== 0) throw new Error(email.stderr || email.stdout || "git config user.email failed");
+      this.initialized = true;
     }
-    const name = await this.git(["--git-dir", gitdir, "config", "user.name", "pi-undo-redo"]);
-    if (name.code !== 0) throw new Error(name.stderr || name.stdout || "git config user.name failed");
-    const email = await this.git(["--git-dir", gitdir, "config", "user.email", "pi-undo-redo@local"]);
-    if (email.code !== 0) throw new Error(email.stderr || email.stdout || "git config user.email failed");
-    this.initialized = true;
   }
 
   private async ensureRepoInfo(): Promise<void> {
@@ -998,20 +1011,25 @@ export class ShadowGit {
     if (!this.sourceGitDir && paths.length === 0) return;
 
     const trackedArgs = this.sourceGitDir ? this.sourceArgs(["ls-files", "-z", "--", ...paths]) : this.shadowArgs(["ls-files", "-z", "--", ...paths]);
-    const [shadowModified, shadowOthers, sourceTracked] = await Promise.all([
-      this.git(this.shadowArgs(["diff-files", "--name-only", "-z", "--", ...paths])),
-      this.git(this.shadowArgs(["ls-files", "--others", "-z", "--", ...paths])),
+    // One call covers both sides: --modified is index-vs-worktree (what diff-files reported) and
+    // --others lists files the shadow index does not know. A git workspace has to prune ignored
+    // trees there, or git descends into node_modules and every other ignored directory on each
+    // snapshot, which costs seconds per message on ordinary web projects; every one of those paths
+    // is then discarded by the check-ignore pass below. Tracked-but-ignored paths are re-admitted
+    // from the shadow index, so pruning here does not shrink snapshot coverage.
+    const changedArgs = ["ls-files", "--modified", "--others", ...(this.sourceGitDir ? ["--exclude-standard"] : [])];
+    const [changed, sourceTracked] = await Promise.all([
+      this.git(this.shadowArgs([...changedArgs, "-z", "--", ...paths])),
       this.git(trackedArgs),
     ]);
-    if (shadowModified.code !== 0 || shadowOthers.code !== 0 || sourceTracked.code !== 0) {
-      throw new Error(shadowModified.stderr || shadowOthers.stderr || sourceTracked.stderr || "failed to list snapshot files");
+    if (changed.code !== 0 || sourceTracked.code !== 0) {
+      throw new Error(changed.stderr || changed.stdout || sourceTracked.stderr || "failed to list snapshot files");
     }
 
     const sourceTrackedSet = new Set(splitNul(sourceTracked.stdout).map(normalizeRelPath).filter(isString));
     const candidates = unique([
-      ...splitNul(shadowModified.stdout).map(normalizeRelPath).filter(isString),
-      ...splitNul(shadowOthers.stdout).map(normalizeRelPath).filter(isString),
-      ...(!this.sourceGitDir ? await this.untrackedExistingPaths(paths, new Set()) : []),
+      ...splitNul(changed.stdout).map(normalizeRelPath).filter(isString),
+      ...(!this.sourceGitDir ? await this.untrackedExistingPaths(paths, new Set()) : await this.missingFromShadowIndex(sourceTrackedSet)),
     ]);
     if (candidates.length === 0) return;
 
@@ -1090,6 +1108,32 @@ export class ShadowGit {
       }),
     );
     return unique(files.filter(isString));
+  }
+
+  /**
+   * Source-tracked paths the shadow index does not know yet. Pruning ignored trees while listing
+   * untracked files also hides tracked files that match an ignore rule, so those are collected
+   * here instead. Deleted paths and directories are skipped: git add rejects a pathspec that does
+   * not resolve to a file, while symlinks are added as links.
+   */
+  private async missingFromShadowIndex(sourceTracked: Set<string>): Promise<string[]> {
+    const listed = await this.git(this.shadowArgs(["ls-files", "-z"]));
+    if (listed.code !== 0) throw new Error(listed.stderr || listed.stdout || "failed to list shadow index files");
+    const known = new Set(splitNul(listed.stdout).map(normalizeRelPath).filter(isString));
+    const missing = await Promise.all(
+      [...sourceTracked].map(async (rel) => {
+        const normalized = normalizeRelPath(rel);
+        if (!normalized || known.has(normalized)) return undefined;
+        try {
+          const info = await lstat(path.join(this.root(), normalized));
+          if (info.isFile() || info.isSymbolicLink()) return normalized;
+        } catch {
+          // deleted paths are not stageable
+        }
+        return undefined;
+      }),
+    );
+    return unique(missing.filter(isString));
   }
 
   private async checkIgnored(files: string[]): Promise<Set<string>> {
